@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>LogAegis: How tamper detection works</title>
+<style>
+:root{--bg:#faf6f0;--surface:#fff;--ink:#241c1c;--muted:#6b5f5f;--line:#e4d9cc;--maroon:#8b1015;--gold:#b8892b;--ok:#1f7a45;--okbg:#e5f3ea;--bad:#b3261e;--badbg:#fbe7e5;--warn:#8a5a00;--warnbg:#fff2d6;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#1b1516;--surface:#262021;--ink:#f3ebe4;--muted:#b8aaa2;--line:#3d3334;--maroon:#e0585d;--gold:#d9ab4f;--ok:#6fcf97;--okbg:#18301f;--bad:#ff8a80;--badbg:#3a1c1a;--warn:#f2c14e;--warnbg:#3a2e12}}
+:root[data-theme="dark"]{--bg:#1b1516;--surface:#262021;--ink:#f3ebe4;--muted:#b8aaa2;--line:#3d3334;--maroon:#e0585d;--gold:#d9ab4f;--ok:#6fcf97;--okbg:#18301f;--bad:#ff8a80;--badbg:#3a1c1a;--warn:#f2c14e;--warnbg:#3a2e12}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:860px;margin:0 auto;padding:20px 16px 48px}
+h1{font:700 28px/1.2 Georgia,"Times New Roman",serif;margin:0 0 6px;color:var(--maroon)}
+p.lead{margin:0 0 18px;color:var(--muted);max-width:62ch}
+.bar{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+button{font:600 14px system-ui,sans-serif;border:1px solid var(--line);background:var(--surface);color:var(--ink);padding:9px 13px;border-radius:8px;cursor:pointer}
+button:hover{border-color:var(--maroon)}
+button:focus-visible{outline:3px solid var(--gold);outline-offset:2px}
+button.primary{background:var(--maroon);color:#fff;border-color:var(--maroon)}
+button.attack{border-color:var(--bad);color:var(--bad)}
+.grp{font-size:13px;color:var(--muted);margin:14px 0 0}
+.rec{background:var(--surface);border:1px solid var(--line);border-left:6px solid var(--line);border-radius:8px;padding:10px 12px;margin:8px 0}
+.rec.ok{border-left-color:var(--ok)}.rec.bad{border-left-color:var(--bad);background:var(--badbg)}.rec.fake{border-style:dashed}
+.top{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-weight:600}
+.ev{margin:2px 0 6px}
+.tags{display:flex;gap:14px;flex-wrap:wrap;font:13px ui-monospace,Menlo,Consolas,monospace;color:var(--muted)}
+.tags b{color:var(--ink);font-weight:600}
+.badge{font-size:13px;font-weight:700;padding:2px 8px;border-radius:99px}
+.badge.ok{background:var(--okbg);color:var(--ok)}.badge.bad{background:var(--badbg);color:var(--bad)}.badge.none{background:var(--line);color:var(--muted)}
+.why{margin:6px 0 0;font-size:14px;color:var(--bad)}
+.cp{background:var(--warnbg);color:var(--warn);border-radius:8px;padding:10px 12px;margin:12px 0;font-size:14px}
+#msg{border-radius:8px;padding:12px 14px;margin:12px 0;background:var(--surface);border:1px solid var(--line);min-height:48px}
+#msg.ok{background:var(--okbg);color:var(--ok)}#msg.bad{background:var(--badbg);color:var(--bad)}
+.note{font-size:13px;color:var(--muted);margin-top:22px;max-width:70ch}
+</style>
+</head>
+<body>
+<main>
+<h1>How LogAegis catches tampering</h1>
+<p class="lead">Each record’s tag is an HMAC-SHA-256 computed with a secret key over the record and the previous tag. Tamper with the log as an attacker would, then press Verify.</p>
+
+<div class="cp" id="cp"></div>
+
+<p class="grp">Attacker actions</p>
+<div class="bar">
+<button class="attack" id="bMod">Modify record 3</button>
+<button class="attack" id="bDelMid">Delete record 3</button>
+<button class="attack" id="bDelEnd">Delete last record</button>
+<button class="attack" id="bIns">Insert fake record</button>
+<button class="attack" id="bFix">Try to fix tags (no key)</button>
+</div>
+<p class="grp">Administrator</p>
+<div class="bar">
+<button class="primary" id="bVer">Verify</button>
+<button id="bReset">Reset</button>
+</div>
+
+<div id="msg" role="status" aria-live="polite">Log is untouched. Press Verify to check it, or tamper with it first.</div>
+<div id="list"></div>
+
+<p class="note">Demo only: the secret key lives in this page so the browser can compute real HMAC-SHA-256 tags. In LogAegis the key stays in protected storage, and the checkpoint is saved by the server where the attacker can’t change it. Tags are shown shortened to 8 characters.</p>
+</main>
+<script>
+const KEY='lab-pc-001-secret', BASE=[
+['08:00','Download setup.exe'],['08:02','Scan setup.exe → Low'],['08:05','Start tool.exe'],['08:07','Network connection opened'],['08:09','Download game.exe']];
+let recs=[], cp=null, results=null;
+const enc=new TextEncoder();
+async function hmac(key,msg){
+  const k=await crypto.subtle.importKey('raw',enc.encode(key),{name:'HMAC',hash:'SHA-256'},false,['sign']);
+  const s=await crypto.subtle.sign('HMAC',k,enc.encode(msg));
+  return [...new Uint8Array(s)].map(b=>b.toString(16).padStart(2,'0')).join('');
+}
+const body=r=>r.seq+'|'+r.time+'|'+r.ev+'|'+r.prev;
+const sh=t=>t.slice(0,8);
+async function init(){
+  recs=[];let prev='0'.repeat(64);
+  BASE.forEach(()=>{});
+  for(let i=0;i<BASE.length;i++){
+    const r={seq:i+1,time:BASE[i][0],ev:BASE[i][1],prev};
+    r.tag=await hmac(KEY,body(r));prev=r.tag;recs.push(r);
+  }
+  cp={seq:recs.length,tag:recs[recs.length-1].tag};
+  results=null;say('Log is untouched. Press Verify to check it, or tamper with it first.','');render();
+}
+function say(t,c){const m=document.getElementById('msg');m.textContent=t;m.className=c||'';}
+function render(){
+  document.getElementById('cp').textContent='Server checkpoint (protected, attacker can’t edit): last record is #'+cp.seq+', tag '+sh(cp.tag);
+  const L=document.getElementById('list');L.textContent='';
+  recs.forEach((r,i)=>{
+    const res=results&&results.rows[i];
+    const d=document.createElement('div');
+    d.className='rec'+(res?(res.issues.length?' bad':' ok'):'')+(r.fake?' fake':'');
+    const st=res?(res.issues.length?'<span class="badge bad">Problem</span>':'<span class="badge ok">Verified</span>'):'<span class="badge none">Not checked</span>';
+    d.innerHTML='<div class="top"><span>Record #'+r.seq+' · '+r.time+'</span>'+st+'</div><div class="ev"></div><div class="tags"><span>prev tag <b>'+sh(r.prev)+'</b></span><span>tag <b>'+sh(r.tag)+'</b></span></div>';
+    d.querySelector('.ev').textContent=r.ev;
+    if(res&&res.issues.length){const w=document.createElement('p');w.className='why';w.textContent=res.issues.join(' ');d.appendChild(w);}
+    L.appendChild(d);
+  });
+}
+async function verify(){
+  const rows=[];let prevTag='0'.repeat(64),expect=1;
+  for(const r of recs){
+    const issues=[];
+    if(r.seq!==expect)issues.push(r.seq<expect?'Duplicate or out-of-order sequence number (expected #'+expect+').':'Sequence gap: expected #'+expect+' but found #'+r.seq+'.');
+    if(r.prev!==prevTag)issues.push('Chain broken: this record points to a previous tag that no longer matches the record before it.');
+    if(await hmac(KEY,body(r))!==r.tag)issues.push('Invalid tag: the contents don’t match the HMAC. Without the key, nobody can make a valid one.');
+    rows.push({issues});prevTag=r.tag;expect=r.seq+1;
+  }
+  const last=recs[recs.length-1];let cpIssue='';
+  if(!last||last.seq<cp.seq)cpIssue='Checkpoint mismatch: the server saved record #'+cp.seq+' but the log now ends earlier. Records were removed from the end.';
+  else if(last.seq===cp.seq&&last.tag!==cp.tag)cpIssue='Checkpoint mismatch: the last tag differs from the one the server saved.';
+  results={rows,cpIssue};render();
+  const bad=rows.filter(x=>x.issues.length).length;
+  if(!bad&&!cpIssue)say('Verified: every tag matches, the sequence is complete, and the last record matches the checkpoint.','ok');
+  else say('Tampering detected. '+(bad?bad+' record(s) failed. ':'')+cpIssue,'bad');
+}
+const act=(f)=>async()=>{results=null;await f();render();};
+bMod.onclick=act(()=>{const r=recs.find(x=>x.seq===3&&!x.fake)||recs[2];if(!r)return;r.ev='Start notepad.exe';say('You edited record 3’s text but couldn’t update its tag. Press Verify.','');});
+bDelMid.onclick=act(()=>{const i=recs.findIndex(x=>x.seq===3);if(i>=0)recs.splice(i,1);say('Record 3 was deleted. Press Verify.','');});
+bDelEnd.onclick=act(()=>{if(recs.length)recs.pop();say('The last record was deleted. The rest of the chain still looks fine. Press Verify.','');});
+bIns.onclick=act(()=>{const p=recs[1]||recs[0];recs.splice(2,0,{seq:3,time:'08:03',ev:'Scan tool.exe → Low (fake)',prev:p?p.tag:'0'.repeat(64),tag:'f4k3'.repeat(16),fake:true});say('A fake record was inserted with a made-up tag. Press Verify.','');});
+bFix.onclick=act(async()=>{let prev='0'.repeat(64);for(const r of recs){r.prev=prev;r.tag=await hmac('attacker-guess',body(r));prev=r.tag;}say('The attacker recomputed every tag with a guessed key. The chain looks consistent, but the key is wrong. Press Verify.','');});
+bVer.onclick=()=>verify();
+bReset.onclick=()=>init();
+try{init();}catch(e){say('This browser can’t run the demo: Web Crypto is unavailable.','bad');}
+</script>
+</body>
+</html>
